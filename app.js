@@ -1,14 +1,14 @@
 require('dotenv').config();
 const { App } = require('@slack/bolt');
-const { Pool } = require('pg');
+const initSqlJs = require('sql.js');
+const fs = require('fs').promises;
+const path = require('path');
 
-// Initialize PostgreSQL connection
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
-});
+// Database file path
+const dbPath = path.join(__dirname, 'kudos.db');
+let db = null;
 
-// Initialize the app with your bot token and signing secret
+// Initialize the app
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
@@ -16,34 +16,52 @@ const app = new App({
   appToken: process.env.SLACK_APP_TOKEN,
 });
 
-// Cache for user list to avoid rate limiting
+// Cache for user list
 let userListCache = null;
 let userListCacheTime = null;
-const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+const CACHE_DURATION = 5 * 60 * 1000;
 
-// Rate limiting for bot usage (prevent spam)
+// Rate limiting
 const userCooldowns = new Map();
 const usersProcessing = new Set();
-const COOLDOWN_MS = 3000; // 3 seconds between commands per user
+const COOLDOWN_MS = 3000;
 
-// Authorized users who can view stats
+// Authorized users
 const AUTHORIZED_STATS_USERS = process.env.AUTHORIZED_STATS_USERS
   ? process.env.AUTHORIZED_STATS_USERS.split(',').map(id => id.trim())
   : [];
 
-// Initialize database table
+// Initialize database
 async function initializeDatabase() {
   try {
-    await pool.query(`
+    const SQL = await initSqlJs();
+
+    // Try to load existing database
+    let buffer;
+    try {
+      buffer = await fs.readFile(dbPath);
+      db = new SQL.Database(buffer);
+      console.log('✅ Loaded existing database');
+    } catch (err) {
+      // Create new database
+      db = new SQL.Database();
+      console.log('✅ Created new database');
+    }
+
+    // Create table if it doesn't exist
+    db.run(`
       CREATE TABLE IF NOT EXISTS kudos (
-        id SERIAL PRIMARY KEY,
-        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        sender_id VARCHAR(50) NOT NULL,
-        recipient_ids TEXT[] NOT NULL,
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT DEFAULT (datetime('now')),
+        sender_id TEXT NOT NULL,
+        recipient_ids TEXT NOT NULL,
         message TEXT NOT NULL,
-        channel_id VARCHAR(50) NOT NULL
+        channel_id TEXT NOT NULL
       )
     `);
+
+    // Save to disk
+    await saveDatabase();
     console.log('✅ Database initialized successfully');
   } catch (error) {
     console.error('❌ Error initializing database:', error);
@@ -51,50 +69,73 @@ async function initializeDatabase() {
   }
 }
 
+// Save database to disk
+async function saveDatabase() {
+  try {
+    const data = db.export();
+    const buffer = Buffer.from(data);
+    await fs.writeFile(dbPath, buffer);
+  } catch (error) {
+    console.error('Error saving database:', error);
+  }
+}
+
 async function getUserList(client) {
   const now = Date.now();
-
   if (userListCache && userListCacheTime && now - userListCacheTime < CACHE_DURATION) {
     return userListCache;
   }
-
   const result = await client.users.list();
   userListCache = result;
   userListCacheTime = now;
-
   return result;
 }
 
-// Record kudos in database
+// Record kudos
 async function recordKudos(senderId, recipientIds, message, channelId) {
   try {
-    await pool.query(
-      'INSERT INTO kudos (sender_id, recipient_ids, message, channel_id) VALUES ($1, $2, $3, $4)',
-      [senderId, recipientIds, message, channelId]
+    db.run(
+      'INSERT INTO kudos (sender_id, recipient_ids, message, channel_id) VALUES (?, ?, ?, ?)',
+      [senderId, JSON.stringify(recipientIds), message, channelId]
     );
+    await saveDatabase();
     console.log('✅ Kudos recorded in database');
   } catch (error) {
     console.error('❌ Error recording kudos:', error);
   }
 }
 
-// Get kudos statistics
-async function getKudosStats(monthsBack = 3) {
+// Get stats
+function getKudosStats(monthsBack = 3) {
   try {
-    const result = await pool.query(
+    const threeMonthsAgo = new Date();
+    threeMonthsAgo.setMonth(threeMonthsAgo.getMonth() - monthsBack);
+    const isoDate = threeMonthsAgo.toISOString();
+
+    const stmt = db.prepare(
       `SELECT sender_id, recipient_ids, timestamp 
        FROM kudos 
-       WHERE timestamp >= NOW() - INTERVAL '${monthsBack} months'
+       WHERE timestamp >= ?
        ORDER BY timestamp DESC`
     );
-    return result.rows;
+
+    stmt.bind([isoDate]);
+    const rows = [];
+    while (stmt.step()) {
+      const row = stmt.getAsObject();
+      row.recipient_ids = JSON.parse(row.recipient_ids);
+      rows.push(row);
+    }
+    stmt.free();
+
+    return rows;
   } catch (error) {
-    console.error('❌ Error fetching kudos stats:', error);
+    console.error('❌ Error fetching stats:', error);
     return [];
   }
 }
 
-// Shared handler function for text-based kudos commands
+// Text kudos handler
 async function handleTextKudosCommand({ command, ack, say, respond, client }) {
   await ack();
 
@@ -155,7 +196,7 @@ async function handleTextKudosCommand({ command, ack, say, respond, client }) {
               recipientUserIds.push(`<@${user.id}>`);
             } else {
               await respond({
-                text: `⚠️ Couldn't find user "@${username}". Make sure the username is correct.`,
+                text: `⚠️ Couldn't find user "@${username}".`,
                 response_type: 'ephemeral',
               });
               return;
@@ -168,7 +209,7 @@ async function handleTextKudosCommand({ command, ack, say, respond, client }) {
         } catch (error) {
           console.error('Error looking up user:', error);
           await respond({
-            text: `❌ Error looking up user. Please try again.`,
+            text: `❌ Error looking up user.`,
             response_type: 'ephemeral',
           });
           return;
@@ -178,7 +219,7 @@ async function handleTextKudosCommand({ command, ack, say, respond, client }) {
 
     if (recipientUserIds.length === 0) {
       await respond({
-        text: '⚠️ Please mention at least one user. Example: `/h5 @john great teamwork!`\n\nOr use `/kudos` (no arguments) to open a form!',
+        text: '⚠️ Please mention at least one user.',
         response_type: 'ephemeral',
       });
       return;
@@ -186,7 +227,7 @@ async function handleTextKudosCommand({ command, ack, say, respond, client }) {
 
     if (!kudosMessage) {
       await respond({
-        text: '⚠️ Please include a message with your kudos. Example: `/h5 @john great teamwork!`',
+        text: '⚠️ Please include a message.',
         response_type: 'ephemeral',
       });
       return;
@@ -208,13 +249,12 @@ async function handleTextKudosCommand({ command, ack, say, respond, client }) {
       channel: command.channel_id,
     });
 
-    // Record kudos in database
     const cleanRecipientIds = recipientUserIds.map(id => id.replace(/<@|>/g, ''));
     await recordKudos(userId, cleanRecipientIds, kudosMessage, command.channel_id);
   } catch (error) {
-    console.error('Error handling kudos command:', error);
+    console.error('Error handling kudos:', error);
     await respond({
-      text: '❌ Sorry, something went wrong while sending kudos. Please try again.',
+      text: '❌ Error sending kudos.',
       response_type: 'ephemeral',
     });
   } finally {
@@ -222,18 +262,24 @@ async function handleTextKudosCommand({ command, ack, say, respond, client }) {
   }
 }
 
-// Handle /h5 and /kudos commands
+// Modal handler
 async function handleKudosCommand({ command, ack, client }) {
   const text = command.text.trim();
 
   if (text) {
-    return handleTextKudosCommand({ command, ack, say: client.chat.postMessage.bind(client.chat), respond: async (msg) => {
+    return handleTextKudosCommand({
+      command,
+      ack,
+      say: client.chat.postMessage.bind(client.chat),
+      respond: async (msg) => {
         await client.chat.postEphemeral({
           channel: command.channel_id,
           user: command.user_id,
           text: msg.text
         });
-      }, client });
+      },
+      client
+    });
   }
 
   await ack();
@@ -244,50 +290,29 @@ async function handleKudosCommand({ command, ack, client }) {
       view: {
         type: 'modal',
         callback_id: 'kudos_modal',
-        title: {
-          type: 'plain_text',
-          text: 'Send Kudos 🙌'
-        },
-        submit: {
-          type: 'plain_text',
-          text: 'Send'
-        },
-        close: {
-          type: 'plain_text',
-          text: 'Cancel'
-        },
+        title: { type: 'plain_text', text: 'Send Kudos 🙌' },
+        submit: { type: 'plain_text', text: 'Send' },
+        close: { type: 'plain_text', text: 'Cancel' },
         blocks: [
           {
             type: 'input',
             block_id: 'recipients_block',
-            label: {
-              type: 'plain_text',
-              text: 'Who deserves kudos?'
-            },
+            label: { type: 'plain_text', text: 'Who deserves kudos?' },
             element: {
               type: 'multi_users_select',
               action_id: 'recipients_select',
-              placeholder: {
-                type: 'plain_text',
-                text: 'Select one or more people'
-              }
+              placeholder: { type: 'plain_text', text: 'Select people' }
             }
           },
           {
             type: 'input',
             block_id: 'message_block',
-            label: {
-              type: 'plain_text',
-              text: 'Your message'
-            },
+            label: { type: 'plain_text', text: 'Your message' },
             element: {
               type: 'plain_text_input',
               action_id: 'message_input',
               multiline: true,
-              placeholder: {
-                type: 'plain_text',
-                text: 'Great teamwork on the project!'
-              }
+              placeholder: { type: 'plain_text', text: 'Great teamwork!' }
             }
           }
         ],
@@ -302,42 +327,19 @@ async function handleKudosCommand({ command, ack, client }) {
   }
 }
 
-// Handle modal submission
+// Modal submission
 app.view('kudos_modal', async ({ ack, body, view, client }) => {
   await ack();
 
   const metadata = JSON.parse(view.private_metadata);
   const userId = metadata.user_id;
   const channelId = metadata.channel_id;
-  const now = Date.now();
-
-  if (usersProcessing.has(userId)) {
-    console.log(`User ${userId} tried to submit kudos while already processing`);
-    return;
-  }
-
-  const lastUsed = userCooldowns.get(userId);
-  if (lastUsed && now - lastUsed < COOLDOWN_MS) {
-    console.log(`User ${userId} hit rate limit`);
-    return;
-  }
-
-  usersProcessing.add(userId);
-  userCooldowns.set(userId, now);
 
   try {
     const recipients = view.state.values.recipients_block.recipients_select.selected_users;
     const message = view.state.values.message_block.message_input.value;
 
-    if (!recipients || recipients.length === 0) {
-      console.error('No recipients selected');
-      return;
-    }
-
-    if (!message || message.trim() === '') {
-      console.error('No message provided');
-      return;
-    }
+    if (!recipients || !message) return;
 
     const recipientMentions = recipients.map(id => `<@${id}>`);
     let recipientsText;
@@ -347,8 +349,7 @@ app.view('kudos_modal', async ({ ack, body, view, client }) => {
       recipientsText = `${recipientMentions[0]} and ${recipientMentions[1]}`;
     } else {
       const allButLast = recipientMentions.slice(0, -1).join(', ');
-      const last = recipientMentions[recipientMentions.length - 1];
-      recipientsText = `${allButLast}, and ${last}`;
+      recipientsText = `${allButLast}, and ${recipientMentions[recipientMentions.length - 1]}`;
     }
 
     await client.chat.postMessage({
@@ -356,20 +357,17 @@ app.view('kudos_modal', async ({ ack, body, view, client }) => {
       text: `🙌 _*High Five* from <@${userId}>:_\n>*${recipientsText}*  _${message}_`
     });
 
-    // Record kudos in database
     await recordKudos(userId, recipients, message, channelId);
   } catch (error) {
-    console.error('Error handling modal submission:', error);
-  } finally {
-    usersProcessing.delete(userId);
+    console.error('Error in modal:', error);
   }
 });
 
-// Register both /h5 and /kudos commands
+// Commands
 app.command('/h5', handleKudosCommand);
 app.command('/kudos', handleKudosCommand);
 
-// Handle /stats command
+// Stats
 app.command('/stats', async ({ command, ack, respond, client }) => {
   await ack();
 
@@ -377,133 +375,94 @@ app.command('/stats', async ({ command, ack, respond, client }) => {
 
   if (AUTHORIZED_STATS_USERS.length > 0 && !AUTHORIZED_STATS_USERS.includes(userId)) {
     await respond({
-      text: '🔒 Sorry, you don\'t have permission to view statistics. Contact your team administrator if you need access.',
+      text: '🔒 No permission to view stats.',
       response_type: 'ephemeral'
     });
     return;
   }
 
   try {
-    const recentKudos = await getKudosStats(3); // Last 3 months
+    const recentKudos = getKudosStats(3);
 
     if (recentKudos.length === 0) {
       await respond({
-        text: '📊 *Kudos Statistics (Last 3 Months)*\n\nNo kudos recorded yet. Be the first to give kudos!',
+        text: '📊 *Kudos Statistics (Last 3 Months)*\n\nNo kudos yet!',
         response_type: 'ephemeral'
       });
       return;
     }
 
-    // Count kudos given by each person
     const giverCounts = {};
     const receiverCounts = {};
 
     recentKudos.forEach(entry => {
-      // Count givers
       giverCounts[entry.sender_id] = (giverCounts[entry.sender_id] || 0) + 1;
-
-      // Count receivers
       entry.recipient_ids.forEach(recipientId => {
         receiverCounts[recipientId] = (receiverCounts[recipientId] || 0) + 1;
       });
     });
 
-    // Sort and get top 5
-    const topGivers = Object.entries(giverCounts)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5);
+    const topGivers = Object.entries(giverCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+    const topReceivers = Object.entries(receiverCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
 
-    const topReceivers = Object.entries(receiverCounts)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5);
-
-    // Fetch user names
     const userCache = {};
     const getUserName = async (userId) => {
       if (userCache[userId]) return userCache[userId];
-
       try {
         const userInfo = await client.users.info({ user: userId });
         const name = userInfo.user.real_name || userInfo.user.name;
         userCache[userId] = name;
         return name;
       } catch (error) {
-        console.error(`Error fetching user ${userId}:`, error);
         return `<@${userId}>`;
       }
     };
 
-    // Format top givers
     let giversText = '';
     for (let i = 0; i < topGivers.length; i++) {
-      const [userId, count] = topGivers[i];
-      const userName = await getUserName(userId);
+      const [uid, count] = topGivers[i];
+      const name = await getUserName(uid);
       const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '  ';
-      giversText += `${medal} *${userName}* - ${count} kudos given\n`;
+      giversText += `${medal} *${name}* - ${count} kudos given\n`;
     }
 
-    // Format top receivers
     let receiversText = '';
     for (let i = 0; i < topReceivers.length; i++) {
-      const [userId, count] = topReceivers[i];
-      const userName = await getUserName(userId);
+      const [uid, count] = topReceivers[i];
+      const name = await getUserName(uid);
       const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : '  ';
-      receiversText += `${medal} *${userName}* - ${count} kudos received\n`;
+      receiversText += `${medal} *${name}* - ${count} kudos received\n`;
     }
 
-    // Send stats message
     await respond({
-      text: `📊 *Kudos Statistics (Last 3 Months)*\n\n*Top 5 Kudos Givers:* 🎁\n${giversText}\n*Top 5 Kudos Receivers:* ⭐\n${receiversText}\n_Total kudos given: ${recentKudos.length}_`,
+      text: `📊 *Kudos Statistics (Last 3 Months)*\n\n*Top 5 Kudos Givers:* 🎁\n${giversText}\n*Top 5 Kudos Receivers:* ⭐\n${receiversText}\n_Total kudos: ${recentKudos.length}_`,
       response_type: 'ephemeral'
     });
   } catch (error) {
     console.error('Error generating stats:', error);
     await respond({
-      text: '❌ Sorry, something went wrong while generating statistics.',
+      text: '❌ Error generating stats.',
       response_type: 'ephemeral'
     });
   }
 });
 
-// Global error handler
+// Error handler
 app.error(async (error) => {
   console.error('App error:', error);
 });
 
-// Health check endpoint
-if (app.receiver && app.receiver.router) {
-  app.receiver.router.get('/health', (req, res) => {
-    res.status(200).json({
-      status: 'ok',
-      uptime: process.uptime(),
-      timestamp: new Date().toISOString(),
-    });
-  });
-}
-
-// Start the app
+// Start
 (async () => {
   try {
-    // Initialize database
     await initializeDatabase();
 
     const port = process.env.PORT || 3000;
     await app.start(port);
     console.log(`⚡️ Slack Kudos Bot is running on port ${port}!`);
-    console.log(`💡 Usage:`);
-    console.log(`   - /kudos @user message          (quick text command)`);
-    console.log(`   - /kudos                         (opens simple form)`);
-    console.log(`   - /stats                         (view kudos leaderboards - private)`);
-    console.log(`\n🔒 Stats Authorization:`);
-    if (AUTHORIZED_STATS_USERS.length > 0) {
-      console.log(`   ✅ Restricted to ${AUTHORIZED_STATS_USERS.length} authorized user(s)`);
-    } else {
-      console.log(`   ⚠️  No restrictions - anyone can view stats`);
-      console.log(`   💡 Add AUTHORIZED_STATS_USERS to .env to restrict access`);
-    }
-    console.log(`\n💾 Database: Connected to PostgreSQL`);
+    console.log(`💾 Database: sql.js SQLite`);
   } catch (error) {
-    console.error('Failed to start application:', error);
+    console.error('Failed to start:', error);
     process.exit(1);
   }
 })();
