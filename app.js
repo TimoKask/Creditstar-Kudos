@@ -4,8 +4,9 @@ const initSqlJs = require('sql.js');
 const fs = require('fs').promises;
 const path = require('path');
 
-// Database file path
-const dbPath = path.join(__dirname, 'kudos.db');
+// Database file path - use DATA_DIR env var for Railway volume
+const dataDir = process.env.DATA_DIR || __dirname;
+const dbPath = path.join(dataDir, 'kudos.db');
 let db = null;
 
 // Initialize the app
@@ -36,28 +37,35 @@ async function initializeDatabase() {
   try {
     const SQL = await initSqlJs();
 
+    // Ensure data directory exists (for Railway volume)
+    try {
+      await fs.mkdir(dataDir, { recursive: true });
+    } catch (err) {
+      // Directory might already exist
+    }
+
     // Try to load existing database
     let buffer;
     try {
       buffer = await fs.readFile(dbPath);
       db = new SQL.Database(buffer);
-      console.log('✅ Loaded existing database');
+      console.log(`✅ Loaded existing database from ${dbPath}`);
     } catch (err) {
       // Create new database
       db = new SQL.Database();
-      console.log('✅ Created new database');
+      console.log(`✅ Created new database at ${dbPath}`);
     }
 
     // Create table if it doesn't exist
     db.run(`
-      CREATE TABLE IF NOT EXISTS kudos (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp TEXT DEFAULT (datetime('now')),
-        sender_id TEXT NOT NULL,
-        recipient_ids TEXT NOT NULL,
-        message TEXT NOT NULL,
-        channel_id TEXT NOT NULL
-      )
+        CREATE TABLE IF NOT EXISTS kudos (
+                                             id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                             timestamp TEXT DEFAULT (datetime('now')),
+            sender_id TEXT NOT NULL,
+            recipient_ids TEXT NOT NULL,
+            message TEXT NOT NULL,
+            channel_id TEXT NOT NULL
+            )
     `);
 
     // Save to disk
@@ -113,8 +121,8 @@ function getKudosStats(monthsBack = 3) {
     const isoDate = threeMonthsAgo.toISOString();
 
     const stmt = db.prepare(
-      `SELECT sender_id, recipient_ids, timestamp 
-       FROM kudos 
+      `SELECT sender_id, recipient_ids, timestamp
+       FROM kudos
        WHERE timestamp >= ?
        ORDER BY timestamp DESC`
     );
@@ -461,7 +469,7 @@ app.error(async (error) => {
     const port = process.env.PORT || 3000;
     await app.start(port);
     console.log(`⚡️ Slack Kudos Bot is running on port ${port}!`);
-    console.log(`💾 Database: sql.js SQLite`);
+    console.log(`💾 Database: ${dbPath}`);
   } catch (error) {
     console.error('Failed to start:', error);
     process.exit(1);
