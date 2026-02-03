@@ -297,6 +297,7 @@ async function handleKudosCommand({ command, ack, client }) {
           {
             type: 'input',
             block_id: 'recipients_block',
+            focus_on_load: true,
             label: { type: 'plain_text', text: 'Who deserves kudos?' },
             element: {
               type: 'multi_users_select',
