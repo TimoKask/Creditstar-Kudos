@@ -70,6 +70,10 @@ async function initializeDatabase() {
 
     // Save to disk
     await saveDatabase();
+
+    // Log entry count
+    const count = db.exec('SELECT COUNT(*) as count FROM kudos')[0]?.values[0][0] || 0;
+    console.log(`📊 Total kudos entries: ${count}`);
     console.log('✅ Database initialized successfully');
   } catch (error) {
     console.error('❌ Error initializing database:', error);
@@ -143,7 +147,7 @@ function getKudosStats(monthsBack = 3) {
   }
 }
 
-// Text kudos handler
+// Text kudos handler (sends directly without modal)
 async function handleTextKudosCommand({ command, ack, say, respond, client }) {
   await ack();
 
@@ -152,7 +156,7 @@ async function handleTextKudosCommand({ command, ack, say, respond, client }) {
 
   if (usersProcessing.has(userId)) {
     await respond({
-      text: `⚠️ Please wait for your previous kudos to finish processing.`,
+      text: '⚠️ Please wait for your previous kudos to finish processing.',
       response_type: 'ephemeral',
     });
     return;
@@ -217,7 +221,7 @@ async function handleTextKudosCommand({ command, ack, say, respond, client }) {
         } catch (error) {
           console.error('Error looking up user:', error);
           await respond({
-            text: `❌ Error looking up user.`,
+            text: '❌ Error looking up user.',
             response_type: 'ephemeral',
           });
           return;
@@ -270,11 +274,55 @@ async function handleTextKudosCommand({ command, ack, say, respond, client }) {
   }
 }
 
-// Modal handler
+// Modal handler - supports prefilling users from command text
 async function handleKudosCommand({ command, ack, client }) {
   const text = command.text.trim();
 
-  if (text) {
+  let mentionedUsers = [];
+  let prefillMessage = '';
+
+  // Check for formatted mentions first: <@U12345>
+  const formattedMatch = text.match(/<@([A-Z0-9]+)(\|[^>]+)?>/g);
+
+  if (formattedMatch && formattedMatch.length > 0) {
+    mentionedUsers = formattedMatch.map(m => m.match(/<@([A-Z0-9]+)/)[1]);
+    const lastMention = formattedMatch[formattedMatch.length - 1];
+    const lastIndex = text.lastIndexOf(lastMention) + lastMention.length;
+    prefillMessage = text.substring(lastIndex).trim();
+  } else {
+    // Check for plain @username mentions
+    const plainMatch = text.match(/@(\w+)/g);
+
+    if (plainMatch && plainMatch.length > 0) {
+      try {
+        const result = await getUserList(client);
+
+        for (const match of plainMatch) {
+          const username = match.substring(1); // Remove @
+          const user = result.members.find(
+            (member) =>
+              member.name === username ||
+              member.profile.display_name === username ||
+              member.profile.display_name_normalized === username
+          );
+
+          if (user) {
+            mentionedUsers.push(user.id);
+          }
+        }
+
+        // Extract message after last @mention
+        const lastMatch = plainMatch[plainMatch.length - 1];
+        const lastIndex = text.lastIndexOf(lastMatch) + lastMatch.length;
+        prefillMessage = text.substring(lastIndex).trim();
+      } catch (error) {
+        console.error('Error looking up users:', error);
+      }
+    }
+  }
+
+  // If we have users AND a message, send directly (no modal)
+  if (mentionedUsers.length > 0 && prefillMessage) {
     return handleTextKudosCommand({
       command,
       ack,
@@ -290,9 +338,21 @@ async function handleKudosCommand({ command, ack, client }) {
     });
   }
 
+  // Otherwise open modal (with pre-filled users if provided)
   await ack();
 
   try {
+    const userSelectElement = {
+      type: 'multi_users_select',
+      action_id: 'recipients_select',
+      placeholder: { type: 'plain_text', text: 'Select people' }
+    };
+
+    // Pre-fill users if mentioned
+    if (mentionedUsers.length > 0) {
+      userSelectElement.initial_users = mentionedUsers;
+    }
+
     await client.views.open({
       trigger_id: command.trigger_id,
       view: {
@@ -305,13 +365,8 @@ async function handleKudosCommand({ command, ack, client }) {
           {
             type: 'input',
             block_id: 'recipients_block',
-            focus_on_load: true,
             label: { type: 'plain_text', text: 'Who deserves kudos?' },
-            element: {
-              type: 'multi_users_select',
-              action_id: 'recipients_select',
-              placeholder: { type: 'plain_text', text: 'Select people' }
-            }
+            element: userSelectElement
           },
           {
             type: 'input',
